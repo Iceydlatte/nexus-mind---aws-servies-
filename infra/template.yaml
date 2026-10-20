@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Nexus Mind personal cloud app (private S3/CloudFront, Cognito, API Gateway, Lambda, DynamoDB, SES)
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  SenderEmail:
+    Type: String
+    Description: Verified Amazon SES identity used as the From address for emailed reports.
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Enter an email address verified in Amazon SES in this Region.
+  SesIdentity:
+    Type: String
+    Description: Exact SES identity name already verified in this Region (email address or domain).
+  BedrockModelId:
+    Type: String
+    Default: global.amazon.nova-2-lite-v1:0
+    Description: Bedrock inference profile used by the conversational assistant.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 20
+    MemorySize: 256
+    Environment:
+      Variables:
+        USER_DATA_TABLE: !Ref UserDataTable
+        SES_SENDER_EMAIL: !Ref SenderEmail
+        APP_DATA_BUCKET: !Ref AppDataBucket
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: nexus-mind-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      EmailConfiguration:
+        EmailSendingAccount: DEVELOPER
+        From: !Ref SenderEmail
+        SourceArn: !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${SesIdentity}
+      MfaConfiguration: 'OFF'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+      UserPoolTags:
+        Project: nexus-mind
+
+  WebClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: nexus-mind-browser
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      ReadAttributes: [email, email_verified]
+      WriteAttributes: [email]
+
+  UserDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub nexus-mind-user-data-${AWS::StackName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: recordType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: recordType
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+      DeletionProtectionEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: nexus-mind
+
+  UserApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub https://${SiteDistribution.DomainName}
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: UserPoolJwt
+        Authorizers:
+          UserPoolJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}
+              audience:
+                - !Ref WebClient
+
+  UserDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub nexus-mind-api-${AWS::StackName}
+      CodeUri: ../backend/lambda/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:PutItem
+              Resource: !GetAtt UserDataTable.Arn
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}
+                - arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${SesIdentity}
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub ${AppDataBucket.Arn}/synthetic/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub ${AppDataBucket.Arn}/reports/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt AppDataBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix: reports/*
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub ${AppDataBucket.Arn}/reports/*
+      Events:
+        GetMyData:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UserApi
+            Path: /me/data
+            Method: GET
+            Auth:
+              Authorizer: UserPoolJwt
+        SaveMyData:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UserApi
+            Path: /me/data
+            Method: PUT
+            Auth:
+              Authorizer: UserPoolJwt
+        DeleteMyData:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UserApi
+            Path: /me/data
+            Method: DELETE
+            Auth:
+              Authorizer: UserPoolJwt
+        EmailMyReport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UserApi
+            Path: /me/email-report
+            Method: POST
+            Auth:
+              Authorizer: UserPoolJwt
+        SaveMyReport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UserApi
+            Path: /me/report
+            Method: POST
+            Auth:
+              Authorizer: UserPoolJwt
+        TaskAssistantChat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UserApi
+            Path: /me/assistant
+            Method: POST
+            Auth:
+              Authorizer: UserPoolJwt
+        GetSyntheticActivities:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UserApi
+            Path: /synthetic/activities
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: nexus-mind
+
+  AppDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldReports
+            Status: Enabled
+            Prefix: reports/
+            ExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: nexus-mind
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub nexus-mind-${AWS::StackName}-oac
+        Description: CloudFront-only access to the private Nexus Mind website bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub Nexus Mind website (${AWS::StackName})
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        Origins:
+          - Id: PrivateS3Origin
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: PrivateS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Project
+          Value: nexus-mind
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
+
+Outputs:
+  WebsiteUrl:
+    Description: Open this HTTPS address to use Nexus Mind.
+    Value: !Sub https://${SiteDistribution.DomainName}
+  WebsiteBucket:
+    Description: Private bucket that stores website files.
+    Value: !Ref SiteBucket
+  AppDataBucket:
+    Description: Private bucket for generated synthetic datasets and emailed report archives.
+    Value: !Ref AppDataBucket
+  CloudFrontDistributionId:
+    Description: Distribution ID used when invalidating cached website files.
+    Value: !Ref SiteDistribution
+  ApiUrl:
+    Description: Authenticated application API.
+    Value: !Sub https://${UserApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+  UserPoolId:
+    Description: Cognito user pool ID used by the browser sign-in screen.
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Public browser client ID (not a secret).
+    Value: !Ref WebClient
+  Region:
+    Description: AWS Region for Cognito and the API.
+    Value: !Ref AWS::Region
